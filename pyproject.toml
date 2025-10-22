@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "gphoto2-server"
+version = "0.1.0"
+description = "Flask server for gphoto2 camera control"
+authors = ["David <david@example.com>"]
+readme = "README_SERVER.md"
+packages = [{include = "app"}]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+flask = "^3.0.0"
+gphoto2 = "^2.5.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+
+[tool.poetry.scripts]
+gphoto-server = "app.camera_server:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
