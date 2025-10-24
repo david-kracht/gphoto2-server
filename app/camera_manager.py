@@ -4,6 +4,7 @@ import gphoto2 as gp
 import logging
 from typing import Optional, Dict, Any, Tuple
 from io import BytesIO
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,9 @@ class CameraManager:
         self.camera: Optional[gp.Camera] = None
         self.context = gp.Context()
         self._camera_model: Optional[str] = None
+        self._preview_lock = threading.Lock()
+        self._active_streams = 0
+        self._stream_lock = threading.Lock()
         
     def connect(self) -> bool:
         """
@@ -468,6 +472,144 @@ class CameraManager:
         except gp.GPhoto2Error as e:
             logger.error(f"Failed to capture image: {e}")
             return None
+    
+    def capture_preview(self) -> Optional[bytes]:
+        """
+        Capture a single preview frame from the camera.
+        
+        Returns:
+            bytes: JPEG data of preview frame or None if capture failed
+        """
+        if not self.is_connected():
+            logger.error("Camera not connected")
+            return None
+        
+        # Use lock to prevent concurrent access
+        with self._preview_lock:
+            try:
+                # Create a CameraFile object to receive the preview
+                camera_file = gp.CameraFile()
+                # Capture preview into the CameraFile
+                self.camera.capture_preview(camera_file, self.context)
+                # Get the data
+                file_data = camera_file.get_data_and_size()
+                
+                # Convert memoryview to bytes if necessary
+                if isinstance(file_data, memoryview):
+                    file_data = file_data.tobytes()
+                
+                # Extract JPEG from the data (find JPEG markers)
+                # JPEG starts with 0xFF 0xD8 and ends with 0xFF 0xD9
+                JPEG_START = b'\xff\xd8'
+                JPEG_END = b'\xff\xd9'
+                
+                # Find the start of JPEG
+                start_pos = file_data.find(JPEG_START)
+                if start_pos == -1:
+                    logger.error("No JPEG start marker found in preview data")
+                    return None
+                
+                # Find the end of JPEG (search from start position)
+                end_pos = file_data.find(JPEG_END, start_pos)
+                if end_pos == -1:
+                    logger.error("No JPEG end marker found in preview data")
+                    return None
+                
+                # Extract the JPEG data (include the end marker)
+                jpeg_data = file_data[start_pos:end_pos + 2]
+                
+                logger.debug(f"Extracted JPEG: {len(jpeg_data)} bytes from {len(file_data)} bytes total")
+                
+                return jpeg_data
+            except gp.GPhoto2Error as e:
+                logger.error(f"Failed to capture preview: {e}")
+                return None
+    
+    
+
+    def enter_preview_mode(self):
+        """
+        Enter preview/live-view mode by opening the viewfinder.
+        This raises the mirror and enables live view.
+        """
+        if not self.is_connected():
+            logger.error("Cannot enter preview mode: camera not connected")
+            return False
+        
+        try:
+            config = self.camera.get_config(self.context)
+            
+            # Try to find and set viewfinder setting
+            try:
+                viewfinder = config.get_child_by_name('viewfinder')
+                viewfinder.set_value(1)  # 1 = open/on
+                self.camera.set_config(config, self.context)
+                logger.info("Viewfinder opened, camera in preview mode")
+                return True
+            except gp.GPhoto2Error as e:
+                # Viewfinder setting not available - some cameras auto-enter on capture_preview
+                logger.debug(f"Viewfinder setting not available: {e}")
+                return True  # Continue anyway, camera might handle it automatically
+        except gp.GPhoto2Error as e:
+            logger.error(f"Could not enter preview mode: {e}")
+            return False
+
+    def start_preview_stream(self):
+        """Increment active stream counter and enter preview mode if first stream."""
+        with self._stream_lock:
+            was_zero = self._active_streams == 0
+            self._active_streams += 1
+            logger.info(f"Preview stream started (total active: {self._active_streams})")
+            
+            # Enter preview mode only when first stream starts
+            if was_zero:
+                logger.info("First stream starting, entering preview mode")
+                self.enter_preview_mode()
+    
+    def end_preview_stream(self):
+        """
+        Decrement active stream counter.
+        Exit preview mode only when no streams are active.
+        """
+        with self._stream_lock:
+            self._active_streams = max(0, self._active_streams - 1)
+            logger.info(f"Preview stream ended (remaining active: {self._active_streams})")
+            
+            if self._active_streams == 0:
+                logger.info("No active streams, exiting preview mode")
+                self.exit_preview_mode()
+            else:
+                logger.info(f"Keeping preview mode active for {self._active_streams} remaining stream(s)")
+    
+    def get_active_streams(self) -> int:
+        """Get number of active preview streams."""
+        with self._stream_lock:
+            return self._active_streams
+    
+    def exit_preview_mode(self):
+        """
+        Exit preview/live-view mode and return camera to idle state.
+        This lowers the mirror and disables live view.
+        """
+        if not self.is_connected():
+            return
+        
+        try:
+            # Try to exit capture mode by triggering a viewfinder close
+            # This is camera-specific, but generally works for most DSLRs
+            config = self.camera.get_config(self.context)
+            
+            # Try to find and set viewfinder setting
+            try:
+                viewfinder = config.get_child_by_name('viewfinder')
+                viewfinder.set_value(0)  # 0 = close/off
+                self.camera.set_config(config, self.context)
+                logger.info("Viewfinder closed, camera returned to idle")
+            except gp.GPhoto2Error:
+                # Viewfinder setting not available, camera might return to idle automatically
+                logger.debug("Viewfinder setting not available")
+        except gp.GPhoto2Error as e:
+            logger.warning(f"Could not explicitly exit preview mode: {e}")
     
     def get_camera_info(self) -> dict:
         """

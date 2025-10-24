@@ -30,6 +30,8 @@ def create_app() -> Flask:
                 "/": "This help message",
                 "/status": "Get camera connection status",
                 "/capture": "Capture and download a photo (GET request with optional parameters)",
+                "/preview": "Live camera preview stream (MJPEG format)",
+                "/preview-page": "HTML page to view the live preview",
                 "/info": "Get camera information including RAW format",
                 "/settings": "Get all available camera settings with current values and options",
                 "/config": "Get or set camera configuration (GET to view, POST with JSON to set)"
@@ -48,12 +50,118 @@ def create_app() -> Flask:
             }
         })
     
+    @app.route('/preview')
+    def preview():
+        """
+        Live camera preview stream as MJPEG.
+        
+        Returns:
+            Response: MJPEG stream (multipart/x-mixed-replace)
+        """
+        def generate():
+            """Generator function that yields preview frames."""
+            import time
+            
+            # Register this stream
+            camera_manager.start_preview_stream()
+            
+            frame_count = 0
+            error_count = 0
+            max_errors = 3
+            
+            try:
+                while True:
+                    frame = camera_manager.capture_preview()
+                    
+                    if frame is None:
+                        error_count += 1
+                        logger.warning(f"Failed to capture preview frame (attempt {error_count}/{max_errors})")
+                        
+                        if error_count >= max_errors:
+                            logger.error("Too many preview errors, stopping stream")
+                            break
+                        
+                        # Wait a bit before retrying
+                        time.sleep(0.5)
+                        continue
+                    
+                    # Reset error counter on success
+                    error_count = 0
+                    frame_count += 1
+                    
+                    # Log first frame details for debugging
+                    if frame_count == 1:
+                        logger.info(f"First frame: {len(frame)} bytes, starts with {frame[:4].hex()}, ends with {frame[-4:].hex()}")
+                    
+                    # Yield frame in multipart format with Content-Length
+                    yield (
+                        b'--frame\r\n'
+                        b'Content-Type: image/jpeg\r\n'
+                        b'Content-Length: ' + str(len(frame)).encode('utf-8') + b'\r\n'
+                        b'\r\n' + frame + b'\r\n'
+                    )
+                    
+                    # Small delay to control frame rate (~30 fps max)
+                    time.sleep(0.033)
+                    
+            except GeneratorExit:
+                logger.info(f"Preview stream closed by client (sent {frame_count} frames)")
+                camera_manager.end_preview_stream()
+            except Exception as e:
+                logger.error(f"Error in preview stream: {e}")
+                camera_manager.end_preview_stream()
+        
+        return Response(generate(),
+                       mimetype='multipart/x-mixed-replace; boundary=frame')
+    
+    @app.route('/preview-page')
+    def preview_page():
+        """HTML page to view the live preview stream."""
+        html = """<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Live Preview</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #1a1a1a; color: #ffffff; display: flex; flex-direction: column; align-items: center; }
+        h1 { color: #4CAF50; margin-bottom: 20px; }
+        .preview-container { max-width: 90%; background-color: #2a2a2a; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3); }
+        #preview-stream { width: 100%; height: auto; border: 2px solid #4CAF50; border-radius: 4px; }
+        .info { margin-top: 20px; padding: 15px; background-color: #333; border-radius: 4px; }
+        .status { display: inline-block; padding: 5px 10px; border-radius: 4px; font-weight: bold; margin-left: 10px; }
+        .status.connected { background-color: #4CAF50; color: white; }
+        .status.disconnected { background-color: #f44336; color: white; }
+    </style>
+</head>
+<body>
+    <h1>📷 Camera Live Preview</h1>
+    <div class="preview-container">
+        <img id="preview-stream" src="/preview" alt="Camera Preview Stream">
+    </div>
+    <div class="info">
+        <p><strong>Stream Status:</strong> <span id="status" class="status">Checking...</span></p>
+        <p><strong>Endpoint:</strong> <code>/preview</code></p>
+        <p><strong>Format:</strong> MJPEG (multipart/x-mixed-replace)</p>
+    </div>
+    <script>
+        const img = document.getElementById("preview-stream");
+        const status = document.getElementById("status");
+        img.onload = function() { status.textContent = "Connected"; status.className = "status connected"; };
+        img.onerror = function() { status.textContent = "Disconnected"; status.className = "status disconnected"; setTimeout(() => { img.src = "/preview?" + new Date().getTime(); }, 3000); };
+        fetch("/status").then(response => response.json()).then(data => { if (data.connected) { status.textContent = "Camera Ready"; status.className = "status connected"; } else { status.textContent = "Camera Not Connected"; status.className = "status disconnected"; } }).catch(err => { status.textContent = "Server Error"; status.className = "status disconnected"; });
+    </script>
+</body>
+</html>"""
+        return html
+
     @app.route('/status')
     def status():
         """Check camera connection status."""
         is_connected = camera_manager.is_connected()
         return jsonify({
             "connected": is_connected,
+            "active_preview_streams": camera_manager.get_active_streams(),
             "timestamp": datetime.now().isoformat()
         })
     
@@ -160,6 +268,91 @@ def create_app() -> Flask:
         })
     
     @app.route('/config', methods=['GET', 'POST'])
+    def config():
+        """
+        Flexible config endpoint - READ or WRITE based on parameters.
+        
+        NO parameters → READ (return current settings)
+        WITH parameters → WRITE (set settings)
+        
+        Works with both GET (URL params) and POST (JSON body).
+        
+        Returns:
+            JSON with configuration info or results
+        """
+        # Get parameters from either URL (GET) or JSON body (POST)
+        if request.method == 'GET':
+            params = request.args.to_dict()
+        else:  # POST
+            params = request.get_json() if request.is_json else {}
+        
+        # NO parameters → READ mode
+        if not params:
+            settings = camera_manager.get_available_settings()
+            return jsonify({
+                "mode": "read",
+                "count": len(settings),
+                "settings": settings
+            })
+        
+        # WITH parameters → WRITE mode
+        logger.info(f"Config WRITE request with {len(params)} settings")
+        results = camera_manager.apply_settings(params)
+        success_count = sum(1 for v in results.values() if v)
+        
+        return jsonify({
+            "mode": "write",
+            "success": success_count == len(params),
+            "applied": success_count,
+            "total": len(params),
+            "results": results
+        })
+    
+    @app.route('/preview/settings', methods=['GET', 'POST'])
+    def preview_settings():
+        """
+        Flexible preview settings endpoint - change settings during live preview.
+        
+        NO parameters → READ (return current settings)
+        WITH parameters → WRITE (set settings)
+        
+        Works with both GET (URL params) and POST (JSON body).
+        Can be used while preview stream is active.
+        
+        Returns:
+            JSON with settings info or results
+        """
+        active_streams = camera_manager.get_active_streams()
+        
+        # Get parameters from either URL (GET) or JSON body (POST)
+        if request.method == 'GET':
+            params = request.args.to_dict()
+        else:  # POST
+            params = request.get_json() if request.is_json else {}
+        
+        # NO parameters → READ mode
+        if not params:
+            settings = camera_manager.get_available_settings()
+            return jsonify({
+                "mode": "read",
+                "active_streams": active_streams,
+                "settings": settings
+            })
+        
+        # WITH parameters → WRITE mode
+        logger.info(f"Preview settings WRITE request with {len(params)} settings (active streams: {active_streams})")
+        results = camera_manager.apply_settings(params)
+        success_count = sum(1 for v in results.values() if v)
+        
+        return jsonify({
+            "mode": "write",
+            "success": success_count == len(params),
+            "applied": success_count,
+            "total": len(params),
+            "results": results,
+            "active_streams": active_streams
+        })
+    
     def config():
         """
         Get or set camera configuration.
